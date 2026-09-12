@@ -409,27 +409,142 @@ function stripMarkdown(s) {
     .trim();
 }
 
+/**
+ * splitSentences(text)
+ *
+ * Splits text into an array of sentences — built for feeding a
+ * text-to-speech / "read aloud" pipeline one sentence at a time.
+ *
+ * KEY DESIGN CHANGE from a fragment-matching regex:
+ * Instead of using String.match() to pull sentence-shaped fragments out
+ * (which can silently SKIP a character position if no alternative matches
+ * there — this is very likely what caused your "disappearing sentence"
+ * bug), this version finds each sentence-boundary position with a regex,
+ * then SLICES the original string between boundaries. Slicing guarantees
+ * every character in the input ends up in the output somewhere — text
+ * cannot vanish, it can only end up in the wrong place.
+ *
+ * Protected from being mistaken for a sentence end:
+ *  - Common abbreviations (Mr., Dr., vs., etc., e.g., i.e., a.m./p.m., U.S., U.K., ...)
+ *  - Initials (J.K. Rowling, A. Smith)
+ *  - Decimals, version numbers, times, IPs (3.14, v2.0.1, 10.30, 192.168.0.1)
+ *  - URLs and emails (including query strings / paths with . ? ! in them)
+ *  - Bare domains (example.com, site.co.uk, mysite.ng)
+ *  - Markdown links/images ([label](url "title")), inline code `like.this()`,
+ *    and fenced ``` code blocks ```
+ *  - Numbered-list markers at the start of a line ("1. Item")
+ *
+ * Also normalizes missing whitespace after real terminal punctuation
+ * ("end.Next" -> "end. Next") so typo run-ons don't merge two sentences.
+ *
+ * Known limitations (inherent to any regex-based splitter, not just this one):
+ *  - A single capital letter that legitimately ends a sentence right before
+ *    another capitalized word ("Turn left at Point A. Then continue.") can
+ *    be mistaken for an initial and left unsplit. True disambiguation needs
+ *    an NLP sentence tokenizer, not regex.
+ *  - Nested dialogue with multiple sentences inside one quote
+ *    (`He said, "Wait. Stop. Now."`) will still split at each internal
+ *    period — this mirrors the original behavior and is a design choice,
+ *    not a bug; merge them yourself downstream if you want the whole quote
+ *    read as one unit.
+ */
 function splitSentences(text) {
-  const paras = text
-    .split(/\n+/)
-    .map(p => p.trim())
-    .filter(Boolean);
+  if (!text || typeof text !== 'string') return [];
 
+  // Placeholders that contain none of . ! ? so they're invisible to the
+  // boundary regex below. Restored to real punctuation at the very end.
+  const maskPunct = (s) =>
+    s.replace(/\./g, '\u0001').replace(/\?/g, '\u0002').replace(/!/g, '\u0003');
+  const unmaskPunct = (s) =>
+    s.replace(/\u0001/g, '.').replace(/\u0002/g, '?').replace(/\u0003/g, '!');
+
+  // For URL-like matches: strip trailing punctuation FIRST so a real
+  // sentence-ending character right after the URL still works, then mask
+  // only the "core" of the match.
+  const maskCoreKeepTrail = (match) => {
+    const trailMatch = match.match(/[.,!?;:'"”’)\]]+$/);
+    const trail = trailMatch ? trailMatch[0] : '';
+    const core = trail ? match.slice(0, -trail.length) : match;
+    return maskPunct(core) + trail;
+  };
+
+  let t = text;
+
+  // --- Markdown-specific protection (safe to leave in even for plain text) ---
+  t = t.replace(/```[\s\S]*?```/g, (m) => maskPunct(m));           // fenced code blocks
+  t = t.replace(/`[^`\n]+`/g, (m) => maskPunct(m));                // inline code
+  t = t.replace(/\]\(([^)]+)\)/g, (m, inner) => `](${maskPunct(inner)})`); // link/image target
+
+  // --- URLs, emails, domains (handles query strings, so a "?" in a URL
+  //     is no longer mistaken for a sentence end) ---
+  t = t.replace(/\b(?:https?:\/\/|www\.)\S+/gi, maskCoreKeepTrail);
+  t = t.replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, (m) => maskPunct(m));
+  t = t.replace(
+    /\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|co|ng|gov|edu|info|biz|ai|dev|app|xyz|co\.uk|co\.ng|org\.ng|gov\.ng)(?:\/\S*)?\b/gi,
+    maskCoreKeepTrail
+  );
+
+  // --- Decimals, version numbers, times, IPs ---
+  t = t.replace(/\b\d+(?:\.\d+)+\b/g, (m) => maskPunct(m));
+
+  // --- Abbreviations that already contain internal periods (longest first,
+  //     so "U.S.A." isn't cut short by a "U.S." match) ---
+  const dottedAbbrevs = [
+    'U\\.S\\.A\\.', 'U\\.S\\.', 'U\\.K\\.', 'U\\.N\\.',
+    'e\\.g\\.', 'i\\.e\\.', 'cf\\.', 'viz\\.',
+    'a\\.m\\.', 'p\\.m\\.', 'A\\.M\\.', 'P\\.M\\.',
+  ];
+  t = t.replace(new RegExp('\\b(?:' + dottedAbbrevs.join('|') + ')', 'g'), (m) => maskPunct(m));
+
+  // --- Abbreviations with a single trailing period ---
+  const simpleAbbrevs = [
+    'Mr','Mrs','Ms','Mx','Dr','Prof','Sr','Jr','St','Rev','Gen','Sgt','Col','Lt','Capt','Fr','Hon',
+    'vs','etc','approx','dept','univ','al',
+    'Jan','Feb','Mar','Apr','Jun','Jul','Aug','Sep','Sept','Oct','Nov','Dec',
+    'Mon','Tue','Tues','Wed','Thu','Thur','Thurs','Fri','Sat','Sun',
+    'Vol','pp','fig','Fig','ch','Ch','sec','Sec','para','Para',
+  ];
+  t = t.replace(new RegExp('\\b(' + simpleAbbrevs.join('|') + ')\\.', 'g'), (m) => maskPunct(m));
+
+  // --- Initials: "J.K. Rowling", "A. Smith" ---
+  t = t.replace(/\b([A-Z])\.(?=[A-Z]\.)/g, (m) => maskPunct(m));      // first of a run: "J."
+  t = t.replace(/\b([A-Z])\.(?=\s[A-Z][a-z])/g, (m) => maskPunct(m)); // last before a name: "K." / "A."
+
+  // --- Numbered-list markers at the start of a line: "1. Item" ---
+  t = t.replace(/^(\s*\d+)\.(?=\s+\S)/gm, (m) => maskPunct(m));
+
+  // --- Fix missing whitespace after a REAL terminal punctuation mark, so
+  //     typo run-ons don't merge two sentences into one ("end.Next" -> "end. Next") ---
+  t = t.replace(/([.!?])(["'”’»)\]]*)([A-Z])/g, (m, p1, quote, cap) => `${p1}${quote} ${cap}`);
+
+  // --- Split into paragraphs, then slice each into sentences by boundary ---
+  const paragraphs = t.split(/\n+/).map((p) => p.trim()).filter(Boolean);
   const out = [];
+  const boundaryRe = /[.!?]+(?:["'”’»)\]]*)?(?=\s|$)/g;
 
-  paras.forEach(p => {
-    const parts = p.match(
-      /[^.!?]+[.!?]+(?:["'”’»)]*)?(?=\s+|$)|[^.!?]+$/g
-    ) || [p];
-
-    parts.forEach(s => {
-      const t = s.trim();
-      if (t) out.push(t);
-    });
+  paragraphs.forEach((para) => {
+    let start = 0;
+    let m;
+    boundaryRe.lastIndex = 0;
+    while ((m = boundaryRe.exec(para)) !== null) {
+      const end = m.index + m[0].length;
+      const sentence = unmaskPunct(para.slice(start, end)).trim();
+      if (sentence) out.push(sentence);
+      start = end;
+    }
+    // Anything left over (no terminal punctuation at all) is still captured
+    // here — this is what guarantees no text can silently disappear.
+    const rest = unmaskPunct(para.slice(start)).trim();
+    if (rest) out.push(rest);
   });
 
   return out;
 }
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { splitSentences };
+}
+
 
 function wordCount(s) { return (s.match(/\S+/g) || []).length; }
 
